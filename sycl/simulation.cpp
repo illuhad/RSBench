@@ -13,6 +13,10 @@ using namespace cl::sycl;
 // line argument.
 ////////////////////////////////////////////////////////////////////////////////////
 
+#ifndef NUM_RUNS
+#define NUM_RUNS 1
+#endif
+
 void run_event_based_simulation(Input in, SimulationData SD, unsigned long * vhash_result, double * kernel_init_time )
 {
 	
@@ -20,16 +24,21 @@ void run_event_based_simulation(Input in, SimulationData SD, unsigned long * vha
 	printf("Allocating an additional %.1lf MB of memory for verification arrays...\n", in.lookups * sizeof(int) /1024.0/1024.0);
 	int * verification_host = (int *) malloc(in.lookups * sizeof(int));
 	
+
+	// Constructing the first SYCL object will cause the SYCL runtime to start up.
+	// So we define the queue outside of the measured range to avoid including this
+	// time, which is typically not interesting.
+	queue sycl_q{default_selector()};
+	
 	// Timers
 	double start = get_time();
-	double stop;
-
+	double stop[NUM_RUNS];
+	
 	// Scope here is important, as when we exit this blocl we will automatically sync with device
 	// to ensure all work is done and that we can read from verification_host array.
 	{
 		// create a queue using the default device for the platform (cpu, gpu)
 
-		queue sycl_q{default_selector()};
 		//queue sycl_q{gpu_selector()};
 		//queue sycl_q{cpu_selector()};
 		printf("Running on: %s\n", sycl_q.get_device().get_info<cl::sycl::info::device::name>().c_str());
@@ -52,10 +61,11 @@ void run_event_based_simulation(Input in, SimulationData SD, unsigned long * vha
 		////////////////////////////////////////////////////////////////////////////////
 		// Define Device Kernel
 		////////////////////////////////////////////////////////////////////////////////
-
-		// queue a kernel to be run, as a lambda
-		sycl_q.submit([&](handler &cgh)
-				{
+		for(int i = 0; i < NUM_RUNS; ++i) 
+		{
+			// queue a kernel to be run, as a lambda
+			sycl_q.submit([&](handler &cgh)
+			{
 				////////////////////////////////////////////////////////////////////////////////
 				// Create Device Accessors for Device Buffers
 				////////////////////////////////////////////////////////////////////////////////
@@ -72,7 +82,7 @@ void run_event_based_simulation(Input in, SimulationData SD, unsigned long * vha
 				// XS Lookup Simulation Loop
 				////////////////////////////////////////////////////////////////////////////////
 				cgh.parallel_for<kernel>(range<1>(in.lookups), [=](id<1> idx)
-					{
+				{
 					// get the index to operate on, first dimemsion
 					size_t i = idx[0];
 
@@ -111,11 +121,14 @@ void run_event_based_simulation(Input in, SimulationData SD, unsigned long * vha
 					}
 					verification[i] = max_idx+1;
 
-					});
 				});
-		stop = get_time();
-		printf("Kernel initialization, compilation, and launch took %.2lf seconds.\n", stop-start);
-		printf("Beginning event based simulation...\n");
+			});
+	
+			printf("Beginning event based simulation...\n");
+			sycl_q.wait();
+			stop[i] = get_time();
+		}
+		
 	}
 
 	// Host reduces the verification array
@@ -124,7 +137,30 @@ void run_event_based_simulation(Input in, SimulationData SD, unsigned long * vha
 		verification_scalar += verification_host[i];
 
 	*vhash_result = verification_scalar;
-	*kernel_init_time = stop-start;
+	
+	if(NUM_RUNS == 1)
+		*kernel_init_time = stop[0]-start;
+	else 
+	{
+		double runtimes [NUM_RUNS];
+		runtimes[0] = stop[0]-start;
+		double average = 0.0;
+		for(int i = 1; i < NUM_RUNS; ++i) {
+			runtimes[i] = stop[i] - stop[i-1];
+			average += runtimes[i];
+		}
+		for(int i = 0; i < NUM_RUNS; ++i) {
+			printf("Run %i took %.4lf seconds\n", i, runtimes[i]);
+		}
+		
+		average /= (NUM_RUNS - 1.0);
+		printf("Average: %.4lf seconds\n", average);
+		
+		double jit_time = ::fmax(runtimes[0]-average, 0.0);
+		printf("JIT overhead: %.4lf seconds\n", jit_time); 
+
+		*kernel_init_time = jit_time;
+	}
 }
 
 template <class INT_T, class DOUBLE_T, class WINDOW_T, class POLE_T >
